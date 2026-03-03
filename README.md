@@ -81,7 +81,7 @@ pip install -e .
 
 - Python ≥ 3.12
 - AWS credentials configured for Bedrock access (see [AWS Configuration](#aws-configuration))
-- The `mt-metrics-eval` package (installed automatically) for loading WMT benchmark data
+- The [`mt-metrics-eval`](https://github.com/google-research/mt-metrics-eval) package (must be installed manually — see [Installation](#installation)) for loading WMT benchmark data
 
 ## Quick Start
 
