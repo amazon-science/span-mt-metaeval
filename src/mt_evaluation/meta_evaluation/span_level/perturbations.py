@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: CC-BY-NC-4.0
 
 from collections import defaultdict
-from typing import Dict, List, Set, Optional
+from typing import Dict, List, Set, Optional, Tuple
 import numpy as np
 
 from mt_evaluation.core import Sample, Error
@@ -12,59 +12,103 @@ from mt_evaluation.meta_evaluation.metrics_to_evaluate import (
 
 # Available perturbation types
 PERTURBATION_EXT_ONLY = "EXT_ONLY"
-PERTURBATION_RAND_REMOVE_05 = "RAND_REMOVE_05"
-PERTURBATION_RAND_REMOVE_09 = "RAND_REMOVE_09"
+PERTURBATION_RAND_REMOVE = "RAND_REMOVE"
 PERTURBATION_REMOVE_ERRORS_IN_SAMPLES_WITH_1 = "REMOVE_ALL_1"
 PERTURBATION_PROGRESSIVE_LENGTH = "PROGRESSIVE_LENGTH"
 
 ALL_PERTURBATIONS = {
     PERTURBATION_EXT_ONLY,
-    PERTURBATION_RAND_REMOVE_05,
-    PERTURBATION_RAND_REMOVE_09,
+    PERTURBATION_RAND_REMOVE,
     PERTURBATION_REMOVE_ERRORS_IN_SAMPLES_WITH_1,
     PERTURBATION_PROGRESSIVE_LENGTH,
 }
 
 
-def increase_spans_length_by_n_characters(sample: Sample, n: int) -> Sample:
+# Languages where each character maps roughly to one "word" unit.
+# For these scripts n characters ≈ n words, so the expansion step is 1.
+# For space-delimited languages the step is scaled by
+# _SPACE_DELIMITED_CHAR_SCALE (≈ average word length) so that
+# "expand by n" is comparable across scripts.
+_CHARACTER_LEVEL_LANGS = {"zh", "ja"}
+
+# Average word length (in characters) for space-delimited languages
+# (English ≈ 4.7, Spanish ≈ 5.2, German ≈ 5.8 → mean ≈ 5).
+_SPACE_DELIMITED_CHAR_SCALE = 5
+
+
+def _get_base_lang_code(lang_code: str) -> str:
+    """Strip regional suffix (e.g. 'ko_KR' -> 'ko', 'zh_CN' -> 'zh')."""
+    return lang_code.split("_")[0]
+
+
+def _get_error_lang_code(lp: str, is_source_error: bool) -> str:
+    """Return the language code for the side of the error.
+
+    Args:
+        lp: Language pair string, e.g. 'en-de', 'ja-zh_CN'.
+        is_source_error: Whether the error is on the source side.
+    """
+    src_code, tgt_code = lp.split("-", 1)
+    return src_code if is_source_error else tgt_code
+
+
+def _is_character_level_lang(lang_code: str) -> bool:
+    """Return True for CJK languages where each character ≈ one word (Chinese, Japanese)."""
+    return _get_base_lang_code(lang_code) in _CHARACTER_LEVEL_LANGS
+
+
+def increase_spans_length_by_n(sample: Sample, n: int, lp: str) -> Sample:
+    """Expand every error span by *n* units on each side.
+
+    For character-level languages (zh, ja) the span grows by *n* characters
+    on each side.  For space-delimited languages (en, es, de, ko, …) the
+    span grows by ``n * _SPACE_DELIMITED_CHAR_SCALE`` characters on each
+    side so that one unit of *n* roughly corresponds to one word.
+    """
     assert sample.evaluation is not None
 
     new_sample = sample.from_dict(sample.to_dict())
 
     for error in new_sample.evaluation.errors:
         start, end = error.start, error.end
+        lang_code = _get_error_lang_code(lp, error.is_source_error)
+        text = sample.src if error.is_source_error else sample.tgt
 
-        if error.is_source_error:
-            new_start = max(start - n, 0)
-            new_end = min(end + n, len(sample.src))
-            new_span = sample.src[new_start:new_end]
+        if _is_character_level_lang(lang_code):
+            delta = n
         else:
-            new_start = max(start - n, 0)
-            new_end = min(end + n, len(sample.tgt))
-            new_span = sample.tgt[new_start:new_end]
+            delta = n * _SPACE_DELIMITED_CHAR_SCALE
+
+        new_start = max(start - delta, 0)
+        new_end = min(end + delta, len(text))
 
         error.start = new_start
         error.end = new_end
-        error.span = new_span
+        error.span = text[new_start:new_end]
 
     return new_sample
 
 
-def remove_errors_from_samples_with_1_error(sample: Sample) -> Sample:
+def remove_errors_from_samples_with_1_error(sample: Sample) -> Tuple[Sample, int, bool]:
     assert sample.evaluation is not None or sample.human_evaluation is not None
 
     new_sample = sample.from_dict(sample.to_dict())
 
+    removed_1 = False
     if new_sample.evaluation is not None:
-        if len(new_sample.evaluation.errors) <= 1:
+        num_errors = len(new_sample.evaluation.errors)
+        if num_errors == 1:
             new_sample.evaluation.errors = []
             new_sample.evaluation.score = 0
+            removed_1 = True
     else:
-        if len(new_sample.human_evaluation.errors) <= 1:
+        num_errors = len(new_sample.human_evaluation.errors)
+        if num_errors == 1:
             new_sample.human_evaluation.errors = []
             new_sample.human_evaluation.score = 0
+            removed_1 = True
 
-    return new_sample
+    return new_sample, num_errors, removed_1
 
 
 def remove_extended_span_from_sample_errors(sample: Sample) -> Sample:
@@ -124,27 +168,134 @@ def remove_spans_with_probability_p(
     return new_sample
 
 
+def extract_perturbations_for_single_autoeval(
+    autoeval: str,
+    lp2preprocessed_samples: Dict[str, List[Sample]],
+    enabled_perturbations: Set[str],
+) -> Tuple[Dict[str, Dict[str, List[Sample]]], Dict[str, Dict[str, Dict[str, int]]]]:
+    """
+    Extract perturbation variants for a single auto-evaluator.
+
+    Args:
+        autoeval: Name of the auto-evaluator.
+        lp2preprocessed_samples: Mapping from language pair to preprocessed samples for this autoeval.
+        enabled_perturbations: Set of perturbation types to generate.
+            Valid values: EXT_ONLY, RAND_REMOVE, REMOVE_ALL_1, PROGRESSIVE_LENGTH
+
+    Returns:
+        Tuple of:
+        - Dictionary mapping variant name -> lp -> list of samples (includes the original under ``autoeval``).
+        - Dictionary mapping variant name -> lp -> metadata dict.
+    """
+    perturbed_variants: Dict[str, Dict[str, List[Sample]]] = defaultdict(dict)
+    perturbed_metadata: Dict[str, Dict[str, Dict[str, int]]] = defaultdict(
+        lambda: defaultdict(dict)
+    )
+
+    do_ext_only = PERTURBATION_EXT_ONLY in enabled_perturbations
+    do_rand_remove = PERTURBATION_RAND_REMOVE in enabled_perturbations
+    do_samples_with_1 = (
+        PERTURBATION_REMOVE_ERRORS_IN_SAMPLES_WITH_1 in enabled_perturbations
+    )
+    progressive_length = PERTURBATION_PROGRESSIVE_LENGTH in enabled_perturbations
+
+    rng = np.random.default_rng(45)
+
+    for lp, samples in lp2preprocessed_samples.items():
+        # normal annotations (always included)
+        perturbed_variants[autoeval][lp] = samples
+
+        if autoeval not in autoevals_with_no_extended_spans:
+            # use extended span in the place of normal spans
+            if do_ext_only:
+                extended_span_only_samples = [
+                    switch_spans_for_extended_spans(sample) for sample in samples
+                ]
+                perturbed_variants[autoeval + "_EXT_ONLY"][lp] = (
+                    extended_span_only_samples
+                )
+
+        if do_samples_with_1:
+            res = [
+                remove_errors_from_samples_with_1_error(sample) for sample in samples
+            ]
+            samples_with_removed_errors = [r[0] for r in res]
+            num_errors_before_removal = sum([r[1] for r in res])
+            n_removed = sum(r[2] for r in res)
+            perturbed_variants[autoeval + "_REMOVE_ALL_1"][lp] = (
+                samples_with_removed_errors
+            )
+            perturbed_metadata[autoeval + "_REMOVE_ALL_1"][lp] = {
+                "num_errors_before_removal": num_errors_before_removal,
+                "num_errors_removed": n_removed,
+            }
+
+        if do_rand_remove:
+            total_errors = sum(len(sample.evaluation.errors) for sample in samples)
+            sampled_nums = rng.random(total_errors).tolist()
+
+            for pct in range(10, 100, 10):
+                p = pct / 100
+                rand_remove_samples = []
+                i = 0
+
+                for sample in samples:
+                    n_errs = len(sample.evaluation.errors)
+                    sample_numbers = sampled_nums[i : i + n_errs]
+                    rand_remove_samples.append(
+                        remove_spans_with_probability_p(
+                            sample,
+                            p,
+                            sample_numbers,
+                        )
+                    )
+                    i += n_errs
+
+                perturbed_variants[autoeval + f"_RAND_REMOVE_{pct}"][lp] = (
+                    rand_remove_samples
+                )
+
+        if progressive_length:
+            for n in range(10, 101, 10):
+                progressive_length_samples = [
+                    increase_spans_length_by_n(sample, n, lp) for sample in samples
+                ]
+                perturbed_variants[autoeval + f"_PROGRESSIVE_LENGTH_{n}"][lp] = (
+                    progressive_length_samples
+                )
+
+    return perturbed_variants, perturbed_metadata
+
+
 def extract_perturbations_from_autoevals(
     autoeval2lp2preprocessed_samples_with_automatic_evaluations: Dict[
         str, Dict[str, List[Sample]]
     ],
     enabled_perturbations: Optional[Set[str]] = None,
-) -> Dict[str, Dict[str, List[Sample]]]:
+) -> Tuple[Dict[str, Dict[str, List[Sample]]], Dict[str, Dict[str, Dict[str, int]]]]:
     """
-    Extract perturbations from auto-evaluations.
+    Extract perturbations from auto-evaluations (bulk version).
+
+    This is a convenience wrapper around :func:`extract_perturbations_for_single_autoeval`
+    that processes all auto-evaluators at once.  For memory-constrained scenarios,
+    prefer calling ``extract_perturbations_for_single_autoeval`` in a loop and
+    freeing each auto-evaluator's data after processing.
 
     Args:
         autoeval2lp2preprocessed_samples_with_automatic_evaluations: Dictionary of auto-evaluations
         enabled_perturbations: Set of perturbation types to generate. If None or empty,
                                no perturbations are generated (only original samples are kept).
-                               Valid values: NO_EXT, EXT_ONLY, RAND_REMOVE_05, RAND_REMOVE_09
+                               Valid values: EXT_ONLY, RAND_REMOVE, REMOVE_ALL_1, PROGRESSIVE_LENGTH
 
     Returns:
         Dictionary with original samples and (optionally) perturbed samples
     """
     # If no perturbations enabled, return the original data as-is
     if not enabled_perturbations:
-        return autoeval2lp2preprocessed_samples_with_automatic_evaluations
+        return (
+            autoeval2lp2preprocessed_samples_with_automatic_evaluations,
+            defaultdict(lambda: defaultdict(dict)),
+        )
 
     # Validate perturbation names
     invalid_perturbations = enabled_perturbations - ALL_PERTURBATIONS
@@ -154,130 +305,21 @@ def extract_perturbations_from_autoevals(
             f"Valid types are: {ALL_PERTURBATIONS}"
         )
 
-    perturbed_autoeval2lp2preprocessed_samples_with_automatic_evaluations = defaultdict(
-        lambda: dict()
+    all_perturbed: Dict[str, Dict[str, List[Sample]]] = {}
+    all_metadata: Dict[str, Dict[str, Dict[str, int]]] = defaultdict(
+        lambda: defaultdict(dict)
     )
-
-    # Check which perturbations are enabled
-    do_ext_only = PERTURBATION_EXT_ONLY in enabled_perturbations
-    do_rand_05 = PERTURBATION_RAND_REMOVE_05 in enabled_perturbations
-    do_rand_09 = PERTURBATION_RAND_REMOVE_09 in enabled_perturbations
-    do_samples_with_1 = (
-        PERTURBATION_REMOVE_ERRORS_IN_SAMPLES_WITH_1 in enabled_perturbations
-    )
-    progressive_length = PERTURBATION_PROGRESSIVE_LENGTH in enabled_perturbations
 
     for (
         autoeval,
         lp2preprocessed_samples,
     ) in autoeval2lp2preprocessed_samples_with_automatic_evaluations.items():
+        variants, metadata = extract_perturbations_for_single_autoeval(
+            autoeval, lp2preprocessed_samples, enabled_perturbations
+        )
+        all_perturbed.update(variants)
+        for variant_name, lp2meta in metadata.items():
+            for lp, meta in lp2meta.items():
+                all_metadata[variant_name][lp] = meta
 
-        rng = np.random.default_rng(45)
-
-        for lp, samples in lp2preprocessed_samples.items():
-            # normal annotations (always included)
-            perturbed_autoeval2lp2preprocessed_samples_with_automatic_evaluations[
-                autoeval
-            ][lp] = samples
-
-            if autoeval not in autoevals_with_no_extended_spans:
-                # Perturbation number 1. --> do not use extended span (this has been removed to use the new parallel processing more easily, as it was incompatible)
-                if False:
-                    no_extended_span_samples = [
-                        remove_extended_span_from_sample_errors(sample)
-                        for sample in samples
-                    ]
-                    perturbed_autoeval2lp2preprocessed_samples_with_automatic_evaluations[
-                        autoeval + "_NO_EXT"
-                    ][
-                        lp
-                    ] = no_extended_span_samples
-
-                # Perturbation number 2. --> use extended span in the place of normal spans
-                if do_ext_only:
-                    extended_span_only_samples = [
-                        switch_spans_for_extended_spans(sample) for sample in samples
-                    ]
-                    perturbed_autoeval2lp2preprocessed_samples_with_automatic_evaluations[
-                        autoeval + "_EXT_ONLY"
-                    ][
-                        lp
-                    ] = extended_span_only_samples
-
-            if do_samples_with_1:
-                samples_with_removed_errors = [
-                    remove_errors_from_samples_with_1_error(sample)
-                    for sample in samples
-                ]
-                perturbed_autoeval2lp2preprocessed_samples_with_automatic_evaluations[
-                    autoeval + "_REMOVE_ALL_1"
-                ][lp] = samples_with_removed_errors
-
-            # Only compute random numbers if needed
-            if do_rand_05 or do_rand_09:
-                total_errors = sum(len(sample.evaluation.errors) for sample in samples)
-                sampled_nums = rng.random(total_errors).tolist()
-
-                i, j = 0, 0
-                zero_point_five_samples = [] if do_rand_05 else None
-                zero_point_one_samples = [] if do_rand_09 else None
-
-                while j < len(samples):
-                    sample = samples[j]
-                    sample_j_numbers = sampled_nums[
-                        i : i + len(sample.evaluation.errors)
-                    ]
-
-                    # Perturbation number 3. --> remove spans with probability 0.5
-                    if do_rand_05:
-                        zero_point_five_samples.append(
-                            remove_spans_with_probability_p(
-                                sample,
-                                0.5,
-                                sample_j_numbers,
-                            )
-                        )
-
-                    # Perturbation number 4. --> remove spans with probability 0.9
-                    if do_rand_09:
-                        zero_point_one_samples.append(
-                            remove_spans_with_probability_p(
-                                sample,
-                                0.9,
-                                sample_j_numbers,
-                            )
-                        )
-
-                    j += 1
-                    i += len(sample.evaluation.errors)
-
-                if do_rand_05:
-                    perturbed_autoeval2lp2preprocessed_samples_with_automatic_evaluations[
-                        autoeval + "_RAND_REMOVE_05"
-                    ][
-                        lp
-                    ] = zero_point_five_samples
-
-                if do_rand_09:
-                    perturbed_autoeval2lp2preprocessed_samples_with_automatic_evaluations[
-                        autoeval + "_RAND_REMOVE_09"
-                    ][
-                        lp
-                    ] = zero_point_one_samples
-
-            # NOTE: for now we use characters, because on WMT25 we have target lengths Chinese and Korean, which are denser. You should use words in other languages
-            if progressive_length:
-                for n in range(1, 100, 10):
-
-                    progressive_length_samples = [
-                        increase_spans_length_by_n_characters(sample, n)
-                        for sample in samples
-                    ]
-
-                    perturbed_autoeval2lp2preprocessed_samples_with_automatic_evaluations[
-                        autoeval + f"_PROGRESSIVE_LENGTH_{n}"
-                    ][
-                        lp
-                    ] = progressive_length_samples
-
-    return perturbed_autoeval2lp2preprocessed_samples_with_automatic_evaluations
+    return all_perturbed, all_metadata
